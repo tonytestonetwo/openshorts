@@ -275,7 +275,70 @@ The backend log on the first job reports the chosen encoder and transcription de
 
 ---
 
-### 6. Run without a Google key (local LLM, optional)
+### 6. Single-Pod Runpod image (optional)
+
+Runpod Pods do not support Docker Compose or Docker-in-Docker. The separate
+`runpod` Docker build target packages the production dashboard, FastAPI backend,
+and Remotion renderer into one Linux image. Nginx serves the dashboard and
+proxies API requests; the renderer and backend communicate over localhost.
+SSH is enabled only for Runpod-injected account keys, with password login
+disabled. The ordinary Docker build and Compose services above are unchanged.
+
+The [Runpod image workflow](.github/workflows/runpod-image.yml) builds this
+target on a GitHub-hosted Linux runner; no local GPU or Docker build is needed.
+It builds and smoke-tests pull requests without publishing and publishes on
+pushes to `main`, version tags (`v*.*.*`), or a manual run on `main`. Each
+published image gets a full commit-SHA tag and a `v0.1.<workflow-run-number>`
+tag; version-tag pushes also get their Git version tag. The workflow uses only
+GitHub's `GITHUB_TOKEN`, with `contents: read` and `packages: write`, and caches
+Docker layers in GitHub Actions. For a public repository, standard
+GitHub-hosted runner usage is free.
+
+The image is published at
+`ghcr.io/tonytestonetwo/openshorts-runpod:<tag>` for this personal fork.
+New GHCR packages start private.
+After the first successful publish, change this package's visibility to public
+in its GitHub Packages settings so Runpod can pull it anonymously; do not change
+the repository's visibility. Until then, Runpod needs a registry credential
+with read access. Public GHCR container storage and transfer are currently free.
+The image contains this public MIT-licensed application; it must never contain
+runtime API keys or `.env` values.
+
+Configure these runtime variables for the initial clip-generation test:
+
+```text
+GEMINI_API_KEY=<your Gemini key>
+WHISPER_MODEL=large-v3-turbo
+WHISPER_DEVICE=cuda
+WHISPER_COMPUTE=float16
+TRANSCRIBE_BACKEND=whisper
+ASR_GPU_CONCURRENCY=1
+MAX_CONCURRENT_JOBS=1
+FFMPEG_ENCODER=auto
+```
+
+`GEMINI_API_KEY` is the only external API key needed for this path. S3, fal.ai,
+ElevenLabs, and Upload-Post are optional for other features and are not needed
+to ingest, select, reframe, and export a clip. Keep the Gemini key in the Pod's
+secret/runtime environment; do not bake it into the image or commit it.
+
+Set `OPENSHORTS_AUTH_USER` and `OPENSHORTS_AUTH_PASSWORD` for nginx Basic
+Authentication. Choose a unique password and keep both values in the Pod's
+runtime environment; the entrypoint writes only a password hash to a temporary
+file.
+
+Expose only container port `8080` as HTTP; nginx applies Basic Authentication
+to every route. Leave direct TCP ports closed. Runpod's basic SSH connection
+uses the account key over its SSH proxy, so a public IP is not needed. A 50 GB
+temporary container disk is a reasonable initial test size for the image,
+downloaded model weights, and a small test video. No persistent volume is
+required; the container disk and its outputs are erased when the Pod stops, so
+download exported MP4s first. Runpod charges for the GPU while it is running;
+stop the Pod between clipping sessions.
+
+---
+
+### 7. Run without a Google key (local LLM, optional)
 
 The only cloud call in the clip pipeline is the moment picker: it sends the
 transcript (never the video) to Gemini. Point it at any OpenAI-compatible

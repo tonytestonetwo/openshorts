@@ -30,8 +30,33 @@ RUN if [ "$GPU" = "1" ]; then \
         onnx-asr onnxruntime-gpu; \
     fi
 
-# Final stage
-FROM python:3.11-slim
+# Bundle the Remotion renderer so it can run beside FastAPI in one Pod image.
+FROM node:18-bookworm-slim AS renderer-builder
+
+WORKDIR /app/render-service
+COPY render-service/package.json render-service/package-lock.json ./
+RUN npm ci
+COPY render-service/tsconfig.json ./tsconfig.json
+COPY render-service/src/ ./src/
+COPY remotion/package.json remotion/package-lock.json /app/remotion/
+COPY remotion/tsconfig.json /app/remotion/tsconfig.json
+COPY remotion/src/ /app/remotion/src/
+COPY remotion/public/ /app/remotion/public/
+RUN cd /app/remotion && npm ci
+RUN npm run build
+
+# Build the production dashboard for the single-container image.
+FROM node:18-alpine AS dashboard-builder
+
+WORKDIR /app/dashboard
+COPY dashboard/package.json dashboard/package-lock.json ./
+RUN npm ci
+COPY dashboard/ ./
+RUN npm run build
+
+# Backend image used by the existing Compose deployment and as the Runpod
+# bundle's base.
+FROM python:3.11-slim AS backend-base
 
 WORKDIR /app
 
@@ -110,9 +135,6 @@ USER appuser
 # Pre-download YOLO model on build (now running as appuser)
 RUN python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"
 
-# Expose FastAPI port
-EXPOSE 8000
-
 # Run FastAPI app. --proxy-headers + --forwarded-allow-ips trust the reverse
 # proxy's X-Forwarded-Proto so generated URLs (e.g. the OAuth redirect_uri) use
 # https in production instead of the internal http scheme.
@@ -135,3 +157,51 @@ HEALTHCHECK --interval=5s --timeout=3s --start-period=30s --retries=2 \
   CMD curl -sf http://127.0.0.1:8000/health/ready > /dev/null || exit 1
 
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "*", "--timeout-graceful-shutdown", "15"]
+
+# Optional Runpod image: bundle FastAPI, Remotion, and the production dashboard
+# into one container. This target is intentionally separate from the existing
+# Compose backend image.
+FROM backend-base AS runpod
+
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    apache2-utils \
+    chromium \
+    nginx \
+    openssh-server \
+    gosu \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=renderer-builder /app/render-service/node_modules /app/render-service/node_modules
+COPY --from=renderer-builder /app/render-service/dist /app/render-service/dist
+COPY --from=renderer-builder /app/remotion /app/remotion
+COPY --from=dashboard-builder /app/dashboard/dist /app/dashboard/dist
+COPY ops/runpod/nginx.conf /etc/nginx/nginx.conf
+COPY ops/runpod/sshd_config /etc/ssh/sshd_config
+COPY ops/runpod/runpod-entrypoint.sh /usr/local/bin/runpod-entrypoint
+
+RUN mkdir -p /tmp/nginx/client_body /tmp/nginx/proxy \
+    && chown -R appuser:appuser /app/render-service /app/remotion /app/dashboard/dist \
+    && chown -R appuser:appuser /tmp/nginx \
+    && chown appuser:appuser /etc/nginx/nginx.conf \
+    && chmod 755 /usr/local/bin/runpod-entrypoint
+
+USER root
+
+ENV RENDER_SERVICE_URL=http://127.0.0.1:3100
+ENV REMOTION_BUNDLE_PATH=/app/remotion
+ENV OUTPUT_DIR=/app/output
+ENV PORT=3100
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
+ENV MAX_CONCURRENT_JOBS=1
+ENV ASR_GPU_CONCURRENCY=1
+
+EXPOSE 22 8080
+
+HEALTHCHECK --interval=5s --timeout=3s --start-period=300s --retries=2 \
+  CMD curl -sf http://127.0.0.1:8000/health/ready > /dev/null || exit 1
+
+ENTRYPOINT ["/usr/local/bin/runpod-entrypoint"]
+
+# Keep the ordinary backend as the default Docker build target.
+FROM backend-base AS final
